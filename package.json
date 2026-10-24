@@ -1,0 +1,12 @@
+{
+  "name": "gold-market-engine",
+  "version": "1.0.0",
+  "description": "Dedicated autonomous 24x7 scraper engine for Gold & Bullion market intelligence",
+  "main": "gold_scraper.js",
+  "scripts": {
+    "start": "node gold_scraper.js"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0"
+  }
+}

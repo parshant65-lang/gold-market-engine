@@ -1,0 +1,36 @@
+name: 24x7 Gold & Bullion Scraper Engine
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: write
+
+concurrency:
+  group: gold-scraper-stream
+  cancel-in-progress: false
+
+jobs:
+  run-gold-scraper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout Scraper Engine
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Launch Autonomous Continuous Gold Engine
+        env:
+          VAULT_PAT: ${{ secrets.VAULT_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node gold_scraper.js
