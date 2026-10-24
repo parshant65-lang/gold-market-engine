@@ -13,11 +13,11 @@ const VAULT_REPO_URL = VAULT_PAT
   : null;
 const VAULT_DIR = path.join('/tmp', 'gold_vault_repo');
 
-const CONCURRENCY = 16;
+const CONCURRENCY = 24; // 24 parallel worker streams for 1 Lakh / 24h throughput
 const RUN_DURATION_MS = 5.5 * 60 * 60 * 1000; // 5.5 hours
 const HANDOVER_TRIGGER_MS = 5 * 60 * 60 * 1000 + 20 * 60 * 1000; // 5h 20m
-const SYNC_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
-const BATCH_SYNC_THRESHOLD = 50; // Sync immediately every 50 articles
+const SYNC_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes failsafe sync
+const BATCH_SYNC_THRESHOLD = 250; // Sync immediately every 250 articles
 const START_TIME = Date.now();
 
 let isShuttingDown = false;
@@ -28,8 +28,8 @@ let totalIngestedSession = 0;
 let isSyncing = false;
 
 // High-speed HTTP agents with Keep-Alive
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 64, timeout: 15000 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 64, timeout: 15000 });
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 128, timeout: 15000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 128, timeout: 15000 });
 
 // User-Agent pool
 const USER_AGENTS = [
@@ -150,7 +150,7 @@ function syncVault(force = false) {
   isSyncing = true;
   try {
     saveRegistry();
-    console.log(`📤 Syncing +${newArticlesCount} items to gold-data-vault (Total this session: ${totalIngestedSession + newArticlesCount})...`);
+    console.log(`📤 Syncing +${newArticlesCount} items to gold-data-vault (Total session: ${totalIngestedSession + newArticlesCount} | Registry: ${Object.keys(registry).length})...`);
     execSync(`cd "${VAULT_DIR}" && git add -A`);
     const status = execSync(`cd "${VAULT_DIR}" && git status --porcelain`).toString().trim();
     if (!status) {
@@ -222,21 +222,45 @@ function storeArticle(sourceSlug, article) {
 }
 
 // -------------------------------------------------------------
-// DEEP SPIDER DISCOVERY MODULES
+// SITEMAP & DEEP ARCHIVE HARVESTING
 // -------------------------------------------------------------
 
-// 1. Kitco News Spider
-async function discoverKitco() {
-  const hubs = [
+// 1. Kitco Sitemaps Harvester (64,000+ Articles)
+async function harvestKitcoSitemaps() {
+  const items = [];
+  const sitemaps = [
+    'https://www.kitco.com/static-sitemaps/news.xml',
+    'https://www.kitco.com/static-sitemaps/opinions.xml',
+    'https://www.kitco.com/static-sitemaps/off-the-wire.xml'
+  ];
+
+  console.log('📜 [Harvester] Ingesting Kitco XML Sitemaps (64,000+ candidate articles)...');
+  for (const sm of sitemaps) {
+    try {
+      const xml = await fetchPage(sm);
+      const matches = xml.match(/<loc>([^<]+)<\/loc>/g) || [];
+      let count = 0;
+      for (const m of matches) {
+        const u = m.replace(/<\/?loc>/g, '').trim();
+        const hash = crypto.createHash('sha256').update(u).digest('hex');
+        if (!registry[hash]) {
+          items.push({ url: u, sourceSlug: 'Kitco_News' });
+          count++;
+        }
+      }
+      console.log(`  ✓ Ingested ${matches.length} total URLs from ${path.basename(sm)} (${count} new)`);
+    } catch (e) {
+      console.warn(`[Kitco Sitemap Error]: ${sm}: ${e.message}`);
+    }
+  }
+
+  // Also include live news hubs
+  const liveHubs = [
     'https://www.kitco.com/news',
     'https://www.kitco.com/news/category/commodities/gold',
-    'https://www.kitco.com/news/category/commodities',
-    'https://www.kitco.com/news/category/mining',
-    'https://www.kitco.com/news/category/economy',
-    'https://www.kitco.com/news/off-the-wire'
+    'https://www.kitco.com/news/category/mining'
   ];
-  const items = [];
-  for (const hub of hubs) {
+  for (const hub of liveHubs) {
     try {
       const html = await fetchPage(hub);
       const $ = cheerio.load(html);
@@ -247,19 +271,17 @@ async function discoverKitco() {
           href = href.split('?')[0].split('#')[0];
           const hash = crypto.createHash('sha256').update(href).digest('hex');
           if (!registry[hash]) {
-            items.push({ url: href, sourceSlug: 'Kitco_News', type: 'article' });
+            items.push({ url: href, sourceSlug: 'Kitco_News' });
           }
         }
       });
-    } catch (e) {
-      console.warn(`[Spider Kitco] Hub ${hub}: ${e.message}`);
-    }
+    } catch (e) {}
   }
   return items;
 }
 
-// 2. BullionVault Deep Archive Spider
-async function discoverBullionVault() {
+// 2. BullionVault Deep Archives Harvester (30 Months, 2024-2026)
+async function harvestBullionVaultArchives() {
   const items = [];
   const archiveHubs = new Set([
     'https://www.bullionvault.com/gold-news/',
@@ -269,22 +291,15 @@ async function discoverBullionVault() {
     'https://www.bullionvault.com/gold-news/news'
   ]);
 
-  // Spider the archive hub to get all past month archives (2024-2026)
   try {
     const archHtml = await fetchPage('https://www.bullionvault.com/gold-news/archive');
-    const $arch = cheerio.load(archHtml);
-    $arch('a[href*="/gold-news/archive/"]').each((_, el) => {
-      let href = $arch(el).attr('href');
-      if (href) {
-        if (href.startsWith('/')) href = 'https://www.bullionvault.com' + href;
-        archiveHubs.add(href);
-      }
-    });
+    const matches = archHtml.match(/https:\/\/www\.bullionvault\.com\/gold-news\/archive\/[0-9]+/g) || [];
+    for (const m of matches) archiveHubs.add(m);
   } catch (e) {
-    console.warn(`[Spider BullionVault Archives Hub]: ${e.message}`);
+    console.warn(`[BullionVault Archive List Error]: ${e.message}`);
   }
 
-  console.log(`🕷️ [Spider BullionVault] Scanning ${archiveHubs.size} monthly archives & categories...`);
+  console.log(`🏛️ [Harvester] Scanning ${archiveHubs.size} BullionVault monthly archives & categories...`);
   for (const hub of archiveHubs) {
     try {
       const html = await fetchPage(hub);
@@ -294,68 +309,82 @@ async function discoverBullionVault() {
         if (href) {
           if (href.startsWith('/')) href = 'https://www.bullionvault.com' + href;
           href = href.split('?')[0].split('#')[0];
-          // Filter out hubs/categories
           if (!href.endsWith('/gold-news') && !href.endsWith('/gold-news/') && !href.includes('/archive') && !href.endsWith('/gold-price-news') && !href.endsWith('/opinion-analysis') && !href.endsWith('/market-fundamentals') && !href.endsWith('/infographics') && !href.endsWith('/news') && !href.endsWith('/history') && !href.endsWith('/gold_books')) {
             const hash = crypto.createHash('sha256').update(href).digest('hex');
             if (!registry[hash]) {
-              items.push({ url: href, sourceSlug: 'BullionVault', type: 'article' });
+              items.push({ url: href, sourceSlug: 'BullionVault' });
             }
           }
         }
       });
-    } catch (e) {
-      // Hub fetch failure
-    }
+    } catch (e) {}
   }
   return items;
 }
 
-// 3. Economic Times Multi-Page Commodities Spider
-async function discoverEconomicTimes() {
+// 3. Economic Times Deep Commodities Pagination Harvester (Pages 1-100)
+async function harvestEconomicTimes() {
   const items = [];
+  console.log('📈 [Harvester] Ingesting Economic Times Commodities News (Pages 1–100)...');
+  
   const pages = [
     'https://economictimes.indiatimes.com/markets/commodities/news',
     'https://economictimes.indiatimes.com/markets/commodities/gold-rate'
   ];
-
-  // Spider pages 2 to 10
-  for (let p = 2; p <= 10; p++) {
+  for (let p = 2; p <= 100; p++) {
     pages.push(`https://economictimes.indiatimes.com/markets/commodities/news/articlelist/msid-50991753,page-${p}.cms`);
   }
 
-  for (const page of pages) {
-    try {
-      const html = await fetchPage(page);
-      const $ = cheerio.load(html);
-      $('a[href*="/articleshow/"]').each((_, el) => {
-        let href = $(el).attr('href');
-        const text = $(el).text().toLowerCase();
-        if (href) {
-          if (href.startsWith('/')) href = 'https://economictimes.indiatimes.com' + href;
-          href = href.split('?')[0].split('#')[0];
-          if (/gold|silver|bullion|precious|mcx/.test(href.toLowerCase()) || /gold|silver|bullion|precious|mcx/.test(text)) {
-            const hash = crypto.createHash('sha256').update(href).digest('hex');
-            if (!registry[hash]) {
-              items.push({ url: href, sourceSlug: 'Economic_Times_Gold', type: 'article' });
+  // Crawl pages concurrently in chunks of 10
+  for (let i = 0; i < pages.length; i += 10) {
+    const chunk = pages.slice(i, i + 10);
+    await Promise.all(chunk.map(async (pageUrl) => {
+      try {
+        const html = await fetchPage(pageUrl);
+        const $ = cheerio.load(html);
+        $('a[href*="/articleshow/"]').each((_, el) => {
+          let href = $(el).attr('href');
+          const text = $(el).text().toLowerCase();
+          if (href) {
+            if (href.startsWith('/')) href = 'https://economictimes.indiatimes.com' + href;
+            href = href.split('?')[0].split('#')[0];
+            if (/gold|silver|bullion|precious|mcx/.test(href.toLowerCase()) || /gold|silver|bullion|precious|mcx/.test(text)) {
+              const hash = crypto.createHash('sha256').update(href).digest('hex');
+              if (!registry[hash]) {
+                items.push({ url: href, sourceSlug: 'Economic_Times_Gold' });
+              }
             }
           }
-        }
-      });
-    } catch (e) {
-      // page scan error
-    }
+        });
+      } catch (e) {}
+    }));
   }
   return items;
 }
 
-// 4. Business Standard Commodities Spider
-async function discoverBusinessStandard() {
+// 4. GoldSeek Harvester
+async function harvestGoldSeek() {
+  const items = [];
+  try {
+    const html = await fetchPage('http://news.goldseek.com/');
+    const matches = html.match(/http:\/\/news\.goldseek\.com\/[^"]*\.php/g) || [];
+    for (const u of matches) {
+      const hash = crypto.createHash('sha256').update(u).digest('hex');
+      if (!registry[hash]) {
+        items.push({ url: u, sourceSlug: 'GoldSeek' });
+      }
+    }
+  } catch (e) {}
+  return items;
+}
+
+// 5. Business Standard Harvester
+async function harvestBusinessStandard() {
   const items = [];
   const hubs = [
     'https://www.business-standard.com/markets/commodities',
     'https://www.business-standard.com/markets/news'
   ];
-
   for (const hub of hubs) {
     try {
       const html = await fetchPage(hub);
@@ -369,20 +398,18 @@ async function discoverBusinessStandard() {
           if (/gold|silver|bullion|precious/.test(href.toLowerCase()) || /gold|silver|bullion|precious/.test(text)) {
             const hash = crypto.createHash('sha256').update(href).digest('hex');
             if (!registry[hash]) {
-              items.push({ url: href, sourceSlug: 'Business_Standard_Gold', type: 'article' });
+              items.push({ url: href, sourceSlug: 'Business_Standard_Gold' });
             }
           }
         }
       });
-    } catch (e) {
-      // Hub scan error
-    }
+    } catch (e) {}
   }
   return items;
 }
 
-// 5. GoodReturns Multi-City Spot Rates Spider
-async function discoverGoodReturns() {
+// 6. GoodReturns Spot Rates Harvester
+async function harvestGoodReturns() {
   const items = [];
   const pages = [
     'https://www.goodreturns.in/gold-rates/',
@@ -394,9 +421,8 @@ async function discoverGoodReturns() {
     'https://www.goodreturns.in/gold-rates/hyderabad.html',
     'https://www.goodreturns.in/gold-rates/ahmedabad.html'
   ];
-
   for (const page of pages) {
-    items.push({ url: page, sourceSlug: 'GoodReturns_Gold', type: 'rate_page' });
+    items.push({ url: page, sourceSlug: 'GoodReturns_Gold' });
   }
   return items;
 }
@@ -489,6 +515,34 @@ function parseEconomicTimes(html, url) {
   };
 }
 
+function parseGoldSeek(html, url) {
+  const $ = cheerio.load(html);
+  const title = $('h1, title').first().text().replace(/\s+/g, ' ').trim();
+  if (!title) return null;
+
+  $('script, style, nav, footer, header').remove();
+  const paragraphs = [];
+  $('p, td.main').each((_, p) => {
+    const txt = $(p).text().replace(/\s+/g, ' ').trim();
+    if (txt.length > 30 && !txt.includes('disclaimer') && !txt.includes('Copyright')) {
+      paragraphs.push(txt);
+    }
+  });
+
+  if (paragraphs.length === 0) return null;
+
+  return {
+    title,
+    url,
+    source: 'GoldSeek',
+    category: 'Precious Metals Commentary',
+    published_at: null,
+    content: paragraphs.join('\n\n'),
+    word_count: paragraphs.join(' ').split(/\s+/).length,
+    tags: ['Gold', 'GoldSeek', 'Bullion']
+  };
+}
+
 function parseBusinessStandard(html, url) {
   const $ = cheerio.load(html);
   const title = $('h1').first().text().trim();
@@ -554,15 +608,16 @@ function parseGoodReturns(html, url) {
 }
 
 // -------------------------------------------------------------
-// HIGH-SPEED CONCURRENT WORKER POOL
+// HIGH-SPEED 24-WORKER CONCURRENT INGESTION ENGINE
 // -------------------------------------------------------------
 
 async function processQueue(queue) {
   const total = queue.length;
-  console.log(`🚀 Starting high-speed parallel extraction of ${total} URLs with ${CONCURRENCY} concurrent workers...`);
+  console.log(`\n🚀 Launching 24-Worker Parallel Extraction Engine for ${total} URLs...`);
 
   let processedCount = 0;
   let successCount = 0;
+  const startTime = Date.now();
 
   async function worker(workerId) {
     while (queue.length > 0 && !isShuttingDown) {
@@ -582,6 +637,8 @@ async function processQueue(queue) {
           article = parseBullionVault(html, item.url);
         } else if (item.sourceSlug === 'Economic_Times_Gold') {
           article = parseEconomicTimes(html, item.url);
+        } else if (item.sourceSlug === 'GoldSeek') {
+          article = parseGoldSeek(html, item.url);
         } else if (item.sourceSlug === 'Business_Standard_Gold') {
           article = parseBusinessStandard(html, item.url);
         } else if (item.sourceSlug === 'GoodReturns_Gold') {
@@ -591,26 +648,28 @@ async function processQueue(queue) {
         if (article) {
           if (storeArticle(item.sourceSlug, article)) {
             successCount++;
-            if (successCount % 10 === 0) {
-              console.log(`  ⚡ [Worker ${workerId}] Ingested ${successCount} items (Latest: "${article.title.slice(0, 45)}...")`);
+            if (successCount % 50 === 0) {
+              const rate = (successCount / ((Date.now() - startTime) / 60000)).toFixed(1);
+              console.log(`  ⚡ Ingested: ${successCount} articles | Speed: ${rate} articles/min | Remaining: ${queue.length}`);
             }
           }
         }
       } catch (err) {
-        // Failed fetch or parse
+        // Skip individual failure
       }
 
       processedCount++;
-      // Minimal polite delay (60ms) to maximize throughput without triggering rate limits
-      await sleep(60);
+      // High-throughput polite delay: 40ms per worker
+      await sleep(40);
     }
   }
 
-  // Launch CONCURRENCY workers concurrently
+  // Launch 24 concurrent workers
   const workers = Array.from({ length: CONCURRENCY }, (_, i) => worker(i + 1));
   await Promise.all(workers);
 
-  console.log(`🏁 Spider extraction cycle complete: Processed ${processedCount} URLs | Ingested ${successCount} new items.`);
+  const durationMin = ((Date.now() - startTime) / 60000).toFixed(1);
+  console.log(`🏁 Queue Drained: Ingested ${successCount} items in ${durationMin} min!`);
 }
 
 // -------------------------------------------------------------
@@ -670,14 +729,14 @@ process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 // -------------------------------------------------------------
 
 async function main() {
-  console.log('================================================================');
-  console.log(`🏆 Blazing-Fast Gold Spider Scraper Pipeline Starting (${CONCURRENCY} Streams)...`);
+  console.log('========================================================================');
+  console.log(`🏆 1 Lakh/24h Gold Intelligence Pipeline Starting (${CONCURRENCY} Parallel Streams)...`);
   console.log(`🕒 Start Time: ${new Date().toISOString()}`);
-  console.log('================================================================');
+  console.log('========================================================================');
 
   initVault();
 
-  // Periodic vault sync every 10 minutes
+  // Periodic vault sync every 5 minutes
   const syncTimer = setInterval(() => {
     syncVault(false);
   }, SYNC_INTERVAL_MS);
@@ -695,40 +754,40 @@ async function main() {
     }
 
     try {
-      console.log('\n🕷️ Commencing Deep Spider Discovery across all gold sources...');
+      console.log('\n🕷️ Ingesting full universe of Gold archives, sitemaps, and feeds...');
       const queue = [];
 
-      const [kitcoItems, bvItems, etItems, bsItems, grItems] = await Promise.all([
-        discoverKitco(),
-        discoverBullionVault(),
-        discoverEconomicTimes(),
-        discoverBusinessStandard(),
-        discoverGoodReturns()
+      const [kitcoItems, bvItems, etItems, gsItems, bsItems, grItems] = await Promise.all([
+        harvestKitcoSitemaps(),
+        harvestBullionVaultArchives(),
+        harvestEconomicTimes(),
+        harvestGoldSeek(),
+        harvestBusinessStandard(),
+        harvestGoodReturns()
       ]);
 
       const seen = new Set();
-      for (const item of [...kitcoItems, ...bvItems, ...etItems, ...bsItems, ...grItems]) {
+      for (const item of [...kitcoItems, ...bvItems, ...etItems, ...gsItems, ...bsItems, ...grItems]) {
         if (!seen.has(item.url)) {
           seen.add(item.url);
           queue.push(item);
         }
       }
 
-      console.log(`🎯 Spider Discovery finished. Discovered ${queue.length} unvisited gold targets!`);
+      console.log(`🎯 Harvester ready! Total unvisited URLs in queue: ${queue.length}`);
 
       if (queue.length > 0) {
         await processQueue(queue);
-        // Sync whatever remains
         syncVault(false);
       } else {
-        console.log('ℹ️ All sources are up-to-date. No new articles to process right now.');
+        console.log('ℹ️ All sources are up-to-date.');
       }
     } catch (err) {
       console.error('❌ Cycle error:', err.message);
     }
 
-    console.log(`💤 Sleeping 2 minutes before next spider sweep... (Elapsed: ${Math.round(elapsed / 60000)}m / 330m)`);
-    await sleep(2 * 60 * 1000);
+    console.log(`💤 Sleeping 3 minutes before next discovery sweep... (Elapsed: ${Math.round(elapsed / 60000)}m / 330m)`);
+    await sleep(3 * 60 * 1000);
   }
 
   clearInterval(syncTimer);
