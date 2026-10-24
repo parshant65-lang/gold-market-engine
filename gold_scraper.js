@@ -13,22 +13,30 @@ const VAULT_REPO_URL = VAULT_PAT
   : null;
 const VAULT_DIR = path.join('/tmp', 'gold_vault_repo');
 
+const CONCURRENCY = 16;
 const RUN_DURATION_MS = 5.5 * 60 * 60 * 1000; // 5.5 hours
 const HANDOVER_TRIGGER_MS = 5 * 60 * 60 * 1000 + 20 * 60 * 1000; // 5h 20m
-const SYNC_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
+const SYNC_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+const BATCH_SYNC_THRESHOLD = 50; // Sync immediately every 50 articles
 const START_TIME = Date.now();
 
 let isShuttingDown = false;
 let nextRelayTriggered = false;
 let registry = {};
 let newArticlesCount = 0;
+let totalIngestedSession = 0;
+let isSyncing = false;
+
+// High-speed HTTP agents with Keep-Alive
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 64, timeout: 15000 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 64, timeout: 15000 });
 
 // User-Agent pool
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0'
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0'
 ];
 
 function getRandomUA() {
@@ -39,11 +47,11 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// HTTP Fetch Helper with automatic redirect and retry
+// Fast HTTP Fetch Helper
 function fetchPage(url, redirectCount = 0) {
   return new Promise((resolve, reject) => {
     if (redirectCount > 5) return reject(new Error(`Too many redirects for ${url}`));
-    
+
     let parsedUrl;
     try {
       parsedUrl = new URL(url);
@@ -51,8 +59,12 @@ function fetchPage(url, redirectCount = 0) {
       return reject(new Error(`Invalid URL: ${url}`));
     }
 
-    const client = parsedUrl.protocol === 'https:' ? https : http;
+    const isHttps = parsedUrl.protocol === 'https:';
+    const client = isHttps ? https : http;
+    const agent = isHttps ? httpsAgent : httpAgent;
+
     const req = client.get(url, {
+      agent,
       headers: {
         'User-Agent': getRandomUA(),
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -89,7 +101,7 @@ function fetchPage(url, redirectCount = 0) {
 // Vault Management
 function initVault() {
   if (!VAULT_REPO_URL) {
-    console.warn('⚠️ VAULT_PAT not set! Running in local testing mode (no remote sync).');
+    console.warn('⚠️ VAULT_PAT not set! Running in local testing mode.');
     if (!fs.existsSync(VAULT_DIR)) fs.mkdirSync(VAULT_DIR, { recursive: true });
     loadRegistry();
     return;
@@ -106,7 +118,6 @@ function initVault() {
     }
   }
 
-  // Ensure git identity
   execSync(`cd "${VAULT_DIR}" && git config user.name "GoldEngine[bot]" && git config user.email "goldengine-bot@users.noreply.github.com"`);
   loadRegistry();
 }
@@ -133,36 +144,39 @@ function saveRegistry() {
 
 function syncVault(force = false) {
   if (!VAULT_REPO_URL) return;
-  if (newArticlesCount === 0 && !force) {
-    console.log('ℹ️ No new articles since last sync. Skipping vault push.');
-    return;
-  }
+  if (newArticlesCount === 0 && !force) return;
+  if (isSyncing) return;
 
+  isSyncing = true;
   try {
     saveRegistry();
-    console.log(`📤 Syncing ${newArticlesCount} new articles to gold-data-vault...`);
+    console.log(`📤 Syncing +${newArticlesCount} items to gold-data-vault (Total this session: ${totalIngestedSession + newArticlesCount})...`);
     execSync(`cd "${VAULT_DIR}" && git add -A`);
     const status = execSync(`cd "${VAULT_DIR}" && git status --porcelain`).toString().trim();
     if (!status) {
       console.log('ℹ️ Working tree clean, nothing to commit.');
+      isSyncing = false;
       return;
     }
 
     const timestamp = new Date().toISOString();
     execSync(`cd "${VAULT_DIR}" && git commit -m "Ingest gold intelligence: +${newArticlesCount} items [${timestamp}]"`);
     execSync(`cd "${VAULT_DIR}" && git push origin main`, { stdio: 'inherit' });
-    console.log(`✅ Successfully synced +${newArticlesCount} items to gold-data-vault!`);
+    console.log(`✅ Successfully pushed +${newArticlesCount} items to gold-data-vault!`);
+    totalIngestedSession += newArticlesCount;
     newArticlesCount = 0;
   } catch (err) {
     console.error('❌ Error syncing to gold-data-vault:', err.message);
+  } finally {
+    isSyncing = false;
   }
 }
 
-// Storage Helper: Saves an article into Data/[Source]/[YYYY]/[MM]/[DD].json
+// Storage Helper
 function storeArticle(sourceSlug, article) {
   const hash = crypto.createHash('sha256').update(article.url || article.id).digest('hex');
   if (registry[hash]) {
-    return false; // Already stored
+    return false;
   }
 
   let dateObj = new Date();
@@ -199,21 +213,29 @@ function storeArticle(sourceSlug, article) {
     source: sourceSlug
   };
   newArticlesCount++;
+
+  if (newArticlesCount >= BATCH_SYNC_THRESHOLD) {
+    syncVault(false);
+  }
+
   return true;
 }
 
 // -------------------------------------------------------------
-// SOURCE 1: Kitco News Scraper
+// DEEP SPIDER DISCOVERY MODULES
 // -------------------------------------------------------------
-async function scrapeKitco() {
-  console.log('🔍 [Kitco News] Scanning latest gold articles...');
+
+// 1. Kitco News Spider
+async function discoverKitco() {
   const hubs = [
     'https://www.kitco.com/news',
     'https://www.kitco.com/news/category/commodities/gold',
-    'https://www.kitco.com/news/category/mining'
+    'https://www.kitco.com/news/category/commodities',
+    'https://www.kitco.com/news/category/mining',
+    'https://www.kitco.com/news/category/economy',
+    'https://www.kitco.com/news/off-the-wire'
   ];
-
-  const articleUrls = new Set();
+  const items = [];
   for (const hub of hubs) {
     try {
       const html = await fetchPage(hub);
@@ -222,81 +244,48 @@ async function scrapeKitco() {
         let href = $(el).attr('href');
         if (href) {
           if (href.startsWith('/')) href = 'https://www.kitco.com' + href;
-          // Filter out hash or query params
           href = href.split('?')[0].split('#')[0];
-          articleUrls.add(href);
+          const hash = crypto.createHash('sha256').update(href).digest('hex');
+          if (!registry[hash]) {
+            items.push({ url: href, sourceSlug: 'Kitco_News', type: 'article' });
+          }
         }
       });
-      await sleep(1000);
-    } catch (err) {
-      console.warn(`[Kitco] Hub scan error (${hub}):`, err.message);
+    } catch (e) {
+      console.warn(`[Spider Kitco] Hub ${hub}: ${e.message}`);
     }
   }
-
-  console.log(`[Kitco] Discovered ${articleUrls.size} candidate article URLs.`);
-  let count = 0;
-  for (const url of articleUrls) {
-    const hash = crypto.createHash('sha256').update(url).digest('hex');
-    if (registry[hash]) continue;
-
-    try {
-      await sleep(600);
-      const artHtml = await fetchPage(url);
-      const $ = cheerio.load(artHtml);
-      const title = $('h1').first().text().trim();
-      if (!title) continue;
-
-      $('script, style, nav, footer, header, .promowidget').remove();
-      const paragraphs = [];
-      $('article p, div[class*="article-body"] p, div[class*="content"] p, main p').each((_, p) => {
-        const txt = $(p).text().replace(/\s+/g, ' ').trim();
-        if (txt.length > 25 && !txt.includes('Kitco NEWS has a diverse team of journalists')) {
-          paragraphs.push(txt);
-        }
-      });
-
-      if (paragraphs.length === 0) continue;
-
-      // Extract publication date from URL if available (/news/article/YYYY-MM-DD/...)
-      const match = url.match(/\/news\/article\/(\d{4}-\d{2}-\d{2})\//);
-      let pubDate = match ? match[1] : null;
-
-      const article = {
-        title,
-        url,
-        source: 'Kitco News',
-        category: 'Gold / Commodities',
-        published_at: pubDate,
-        content: paragraphs.join('\n\n'),
-        word_count: paragraphs.join(' ').split(/\s+/).length,
-        tags: ['Gold', 'Kitco', 'Precious Metals', 'Commodities']
-      };
-
-      if (storeArticle('Kitco_News', article)) {
-        count++;
-        console.log(`  ✨ [Kitco] Saved: "${title.slice(0, 60)}..."`);
-      }
-    } catch (err) {
-      console.warn(`[Kitco] Error scraping ${url}:`, err.message);
-    }
-  }
-  console.log(`[Kitco News] Finished cycle. Ingested ${count} new articles.`);
+  return items;
 }
 
-// -------------------------------------------------------------
-// SOURCE 2: BullionVault Scraper
-// -------------------------------------------------------------
-async function scrapeBullionVault() {
-  console.log('🔍 [BullionVault] Scanning gold news and market insights...');
-  const hubs = [
+// 2. BullionVault Deep Archive Spider
+async function discoverBullionVault() {
+  const items = [];
+  const archiveHubs = new Set([
     'https://www.bullionvault.com/gold-news/',
     'https://www.bullionvault.com/gold-news/gold-price-news',
     'https://www.bullionvault.com/gold-news/market-fundamentals',
-    'https://www.bullionvault.com/gold-news/opinion-analysis'
-  ];
+    'https://www.bullionvault.com/gold-news/opinion-analysis',
+    'https://www.bullionvault.com/gold-news/news'
+  ]);
 
-  const articleUrls = new Set();
-  for (const hub of hubs) {
+  // Spider the archive hub to get all past month archives (2024-2026)
+  try {
+    const archHtml = await fetchPage('https://www.bullionvault.com/gold-news/archive');
+    const $arch = cheerio.load(archHtml);
+    $arch('a[href*="/gold-news/archive/"]').each((_, el) => {
+      let href = $arch(el).attr('href');
+      if (href) {
+        if (href.startsWith('/')) href = 'https://www.bullionvault.com' + href;
+        archiveHubs.add(href);
+      }
+    });
+  } catch (e) {
+    console.warn(`[Spider BullionVault Archives Hub]: ${e.message}`);
+  }
+
+  console.log(`🕷️ [Spider BullionVault] Scanning ${archiveHubs.size} monthly archives & categories...`);
+  for (const hub of archiveHubs) {
     try {
       const html = await fetchPage(hub);
       const $ = cheerio.load(html);
@@ -305,257 +294,329 @@ async function scrapeBullionVault() {
         if (href) {
           if (href.startsWith('/')) href = 'https://www.bullionvault.com' + href;
           href = href.split('?')[0].split('#')[0];
-          // Filter out landing categories
-          if (!href.endsWith('/gold-news/') && !href.endsWith('/gold-price-news') && !href.endsWith('/opinion-analysis') && !href.endsWith('/market-fundamentals') && !href.endsWith('/infographics')) {
-            articleUrls.add(href);
+          // Filter out hubs/categories
+          if (!href.endsWith('/gold-news') && !href.endsWith('/gold-news/') && !href.includes('/archive') && !href.endsWith('/gold-price-news') && !href.endsWith('/opinion-analysis') && !href.endsWith('/market-fundamentals') && !href.endsWith('/infographics') && !href.endsWith('/news') && !href.endsWith('/history') && !href.endsWith('/gold_books')) {
+            const hash = crypto.createHash('sha256').update(href).digest('hex');
+            if (!registry[hash]) {
+              items.push({ url: href, sourceSlug: 'BullionVault', type: 'article' });
+            }
           }
         }
       });
-      await sleep(1000);
-    } catch (err) {
-      console.warn(`[BullionVault] Hub scan error (${hub}):`, err.message);
+    } catch (e) {
+      // Hub fetch failure
     }
   }
+  return items;
+}
 
-  console.log(`[BullionVault] Discovered ${articleUrls.size} candidate article URLs.`);
-  let count = 0;
-  for (const url of articleUrls) {
-    const hash = crypto.createHash('sha256').update(url).digest('hex');
-    if (registry[hash]) continue;
+// 3. Economic Times Multi-Page Commodities Spider
+async function discoverEconomicTimes() {
+  const items = [];
+  const pages = [
+    'https://economictimes.indiatimes.com/markets/commodities/news',
+    'https://economictimes.indiatimes.com/markets/commodities/gold-rate'
+  ];
 
+  // Spider pages 2 to 10
+  for (let p = 2; p <= 10; p++) {
+    pages.push(`https://economictimes.indiatimes.com/markets/commodities/news/articlelist/msid-50991753,page-${p}.cms`);
+  }
+
+  for (const page of pages) {
     try {
-      await sleep(600);
-      const artHtml = await fetchPage(url);
-      const $ = cheerio.load(artHtml);
-      const title = $('h1').first().text().trim();
-      if (!title || title.toLowerCase() === 'gold price news') continue;
-
-      const dateStr = $('.submitted').first().text().trim();
-      $('script, style, nav, footer, header').remove();
-
-      const paragraphs = [];
-      $('.content p, article p, .node-article p').each((_, p) => {
-        const txt = $(p).text().replace(/\s+/g, ' ').trim();
-        if (txt.length > 25 && !txt.includes('All rights reserved')) {
-          paragraphs.push(txt);
+      const html = await fetchPage(page);
+      const $ = cheerio.load(html);
+      $('a[href*="/articleshow/"]').each((_, el) => {
+        let href = $(el).attr('href');
+        const text = $(el).text().toLowerCase();
+        if (href) {
+          if (href.startsWith('/')) href = 'https://economictimes.indiatimes.com' + href;
+          href = href.split('?')[0].split('#')[0];
+          if (/gold|silver|bullion|precious|mcx/.test(href.toLowerCase()) || /gold|silver|bullion|precious|mcx/.test(text)) {
+            const hash = crypto.createHash('sha256').update(href).digest('hex');
+            if (!registry[hash]) {
+              items.push({ url: href, sourceSlug: 'Economic_Times_Gold', type: 'article' });
+            }
+          }
         }
       });
-
-      if (paragraphs.length === 0) continue;
-
-      const article = {
-        title,
-        url,
-        source: 'BullionVault',
-        category: 'Physical Gold / London Bullion',
-        published_at: dateStr || null,
-        content: paragraphs.join('\n\n'),
-        word_count: paragraphs.join(' ').split(/\s+/).length,
-        tags: ['Gold', 'BullionVault', 'LBMA', 'Bullion']
-      };
-
-      if (storeArticle('BullionVault', article)) {
-        count++;
-        console.log(`  ✨ [BullionVault] Saved: "${title.slice(0, 60)}..."`);
-      }
-    } catch (err) {
-      console.warn(`[BullionVault] Error scraping ${url}:`, err.message);
+    } catch (e) {
+      // page scan error
     }
   }
-  console.log(`[BullionVault] Finished cycle. Ingested ${count} new articles.`);
+  return items;
 }
 
-// -------------------------------------------------------------
-// SOURCE 3: Economic Times (Gold & Precious Metals)
-// -------------------------------------------------------------
-async function scrapeEconomicTimes() {
-  console.log('🔍 [Economic Times] Scanning commodities gold articles...');
-  const hub = 'https://economictimes.indiatimes.com/markets/commodities/news';
-  const articleUrls = new Set();
+// 4. Business Standard Commodities Spider
+async function discoverBusinessStandard() {
+  const items = [];
+  const hubs = [
+    'https://www.business-standard.com/markets/commodities',
+    'https://www.business-standard.com/markets/news'
+  ];
 
-  try {
-    const html = await fetchPage(hub);
-    const $ = cheerio.load(html);
-    $('a[href*="/articleshow/"]').each((_, el) => {
-      let href = $(el).attr('href');
-      const text = $(el).text().toLowerCase();
-      if (href) {
-        if (href.startsWith('/')) href = 'https://economictimes.indiatimes.com' + href;
-        href = href.split('?')[0].split('#')[0];
-        // Focus strictly on Gold & Precious metals / MCX
-        if (/gold|silver|bullion|precious|mcx/.test(href.toLowerCase()) || /gold|silver|bullion|precious/.test(text)) {
-          articleUrls.add(href);
-        }
-      }
-    });
-  } catch (err) {
-    console.warn('[Economic Times] Hub scan error:', err.message);
-  }
-
-  console.log(`[Economic Times] Discovered ${articleUrls.size} candidate Gold articles.`);
-  let count = 0;
-  for (const url of articleUrls) {
-    const hash = crypto.createHash('sha256').update(url).digest('hex');
-    if (registry[hash]) continue;
-
+  for (const hub of hubs) {
     try {
-      await sleep(600);
-      const artHtml = await fetchPage(url);
-      const $ = cheerio.load(artHtml);
-      const title = $('h1.artTitle, h1').first().text().trim();
-      if (!title) continue;
-
-      $('.artText').find('script, style, .promowidget, .embed_code, .stock_widget, table').remove();
-      const content = $('.artText').text().replace(/\s+/g, ' ').trim();
-      if (content.length < 50) continue;
-
-      const dateStr = $('.dt_block, .publish_date, time').first().text().trim();
-
-      const article = {
-        title,
-        url,
-        source: 'The Economic Times (Gold)',
-        category: 'Domestic & MCX Gold',
-        published_at: dateStr || null,
-        content,
-        word_count: content.split(/\s+/).length,
-        tags: ['Gold', 'Economic Times', 'MCX', 'India Gold Rates']
-      };
-
-      if (storeArticle('Economic_Times_Gold', article)) {
-        count++;
-        console.log(`  ✨ [Economic Times] Saved: "${title.slice(0, 60)}..."`);
-      }
-    } catch (err) {
-      console.warn(`[Economic Times] Error scraping ${url}:`, err.message);
-    }
-  }
-  console.log(`[Economic Times] Finished cycle. Ingested ${count} new articles.`);
-}
-
-// -------------------------------------------------------------
-// SOURCE 4: Business Standard (Commodities & Gold)
-// -------------------------------------------------------------
-async function scrapeBusinessStandard() {
-  console.log('🔍 [Business Standard] Scanning commodities gold articles...');
-  const hub = 'https://www.business-standard.com/markets/commodities';
-  const articleUrls = new Set();
-
-  try {
-    const html = await fetchPage(hub);
-    const $ = cheerio.load(html);
-    $('a[href*=".html"]').each((_, el) => {
-      let href = $(el).attr('href');
-      const text = $(el).text().toLowerCase();
-      if (href) {
-        if (href.startsWith('/')) href = 'https://www.business-standard.com' + href;
-        href = href.split('?')[0].split('#')[0];
-        if (/gold|silver|bullion|precious/.test(href.toLowerCase()) || /gold|silver|bullion|precious/.test(text)) {
-          articleUrls.add(href);
-        }
-      }
-    });
-  } catch (err) {
-    console.warn('[Business Standard] Hub scan error:', err.message);
-  }
-
-  console.log(`[Business Standard] Discovered ${articleUrls.size} candidate Gold articles.`);
-  let count = 0;
-  for (const url of articleUrls) {
-    const hash = crypto.createHash('sha256').update(url).digest('hex');
-    if (registry[hash]) continue;
-
-    try {
-      await sleep(600);
-      const artHtml = await fetchPage(url);
-      const $ = cheerio.load(artHtml);
-      const title = $('h1').first().text().trim();
-      if (!title) continue;
-
-      const dateStr = $('div[data-updatedtime]').attr('data-updatedtime') || $('.meta-info').first().text().trim();
-      $('script, style, nav, footer, header').remove();
-
-      const paragraphs = [];
-      $('.storydetail p, article p').each((_, p) => {
-        const txt = $(p).text().replace(/\s+/g, ' ').trim();
-        if (txt.length > 25 && !txt.includes('First Published:')) {
-          paragraphs.push(txt);
+      const html = await fetchPage(hub);
+      const $ = cheerio.load(html);
+      $('a[href*=".html"]').each((_, el) => {
+        let href = $(el).attr('href');
+        const text = $(el).text().toLowerCase();
+        if (href) {
+          if (href.startsWith('/')) href = 'https://www.business-standard.com' + href;
+          href = href.split('?')[0].split('#')[0];
+          if (/gold|silver|bullion|precious/.test(href.toLowerCase()) || /gold|silver|bullion|precious/.test(text)) {
+            const hash = crypto.createHash('sha256').update(href).digest('hex');
+            if (!registry[hash]) {
+              items.push({ url: href, sourceSlug: 'Business_Standard_Gold', type: 'article' });
+            }
+          }
         }
       });
-
-      if (paragraphs.length === 0) continue;
-
-      const article = {
-        title,
-        url,
-        source: 'Business Standard (Gold)',
-        category: 'Commodities & Gold Markets',
-        published_at: dateStr || null,
-        content: paragraphs.join('\n\n'),
-        word_count: paragraphs.join(' ').split(/\s+/).length,
-        tags: ['Gold', 'Business Standard', 'Bullion', 'MCX']
-      };
-
-      if (storeArticle('Business_Standard_Gold', article)) {
-        count++;
-        console.log(`  ✨ [Business Standard] Saved: "${title.slice(0, 60)}..."`);
-      }
-    } catch (err) {
-      console.warn(`[Business Standard] Error scraping ${url}:`, err.message);
+    } catch (e) {
+      // Hub scan error
     }
   }
-  console.log(`[Business Standard] Finished cycle. Ingested ${count} new articles.`);
+  return items;
+}
+
+// 5. GoodReturns Multi-City Spot Rates Spider
+async function discoverGoodReturns() {
+  const items = [];
+  const pages = [
+    'https://www.goodreturns.in/gold-rates/',
+    'https://www.goodreturns.in/gold-rates/delhi.html',
+    'https://www.goodreturns.in/gold-rates/mumbai.html',
+    'https://www.goodreturns.in/gold-rates/chennai.html',
+    'https://www.goodreturns.in/gold-rates/bangalore.html',
+    'https://www.goodreturns.in/gold-rates/kolkata.html',
+    'https://www.goodreturns.in/gold-rates/hyderabad.html',
+    'https://www.goodreturns.in/gold-rates/ahmedabad.html'
+  ];
+
+  for (const page of pages) {
+    items.push({ url: page, sourceSlug: 'GoodReturns_Gold', type: 'rate_page' });
+  }
+  return items;
 }
 
 // -------------------------------------------------------------
-// SOURCE 5: GoodReturns India Spot Rates & Gold Insights
+// DEDICATED PARSERS
 // -------------------------------------------------------------
-async function scrapeGoodReturns() {
-  console.log('🔍 [GoodReturns] Scanning India city-wise daily gold rates...');
-  const url = 'https://www.goodreturns.in/gold-rates/';
-  try {
-    const html = await fetchPage(url);
-    const $ = cheerio.load(html);
-    const title = $('h1').first().text().trim() || 'Gold Rate Today in India';
-    
-    const cityRates = [];
-    $('table tr').each((_, tr) => {
-      const tds = $(tr).find('td').map((_, el) => $(el).text().replace(/\s+/g, ' ').trim()).get();
-      if (tds.length >= 3 && tds[0] && (tds[1].includes('₹') || tds[1].replace(/[^0-9]/g, '').length >= 4)) {
-        cityRates.push({
-          city_or_unit: tds[0],
-          rate_22k: tds[1],
-          rate_24k: tds[2] || tds[1]
-        });
-      }
-    });
 
-    if (cityRates.length > 0) {
-      const todayStr = new Date().toISOString().split('T')[0];
-      const rateArticle = {
-        id: `goodreturns-gold-rate-${todayStr}`,
-        url: `${url}#${todayStr}`,
-        title: `${title} (${todayStr})`,
-        source: 'GoodReturns (Gold Rates)',
-        category: 'India Spot 24K & 22K Rates',
-        published_at: todayStr,
-        rates_data: cityRates,
-        content: `Official domestic gold rates snapshot for ${todayStr}. Included cities and slabs: ${cityRates.map(r => `${r.city_or_unit}: 22K=${r.rate_22k}, 24K=${r.rate_24k}`).join('; ')}`,
-        tags: ['India Gold Rates', '24K Gold', '22K Gold', 'GoodReturns']
-      };
+function parseKitco(html, url) {
+  const $ = cheerio.load(html);
+  const title = $('h1').first().text().trim();
+  if (!title) return null;
 
-      if (storeArticle('GoodReturns_Gold', rateArticle)) {
-        console.log(`  ✨ [GoodReturns] Recorded daily domestic rates snapshot (${cityRates.length} city/weight slabs).`);
-      }
+  $('script, style, nav, footer, header, .promowidget').remove();
+  const paragraphs = [];
+  $('article p, div[class*="article-body"] p, div[class*="content"] p, main p').each((_, p) => {
+    const txt = $(p).text().replace(/\s+/g, ' ').trim();
+    if (txt.length > 25 && !txt.includes('Kitco NEWS has a diverse team of journalists')) {
+      paragraphs.push(txt);
     }
-  } catch (err) {
-    console.warn('[GoodReturns] Scraping error:', err.message);
-  }
+  });
+
+  if (paragraphs.length === 0) return null;
+
+  const match = url.match(/\/news\/article\/(\d{4}-\d{2}-\d{2})\//);
+  let pubDate = match ? match[1] : null;
+
+  return {
+    title,
+    url,
+    source: 'Kitco News',
+    category: 'Gold / Commodities',
+    published_at: pubDate,
+    content: paragraphs.join('\n\n'),
+    word_count: paragraphs.join(' ').split(/\s+/).length,
+    tags: ['Gold', 'Kitco', 'Precious Metals', 'Commodities']
+  };
+}
+
+function parseBullionVault(html, url) {
+  const $ = cheerio.load(html);
+  const title = $('h1').first().text().trim();
+  if (!title || title.toLowerCase() === 'gold price news') return null;
+
+  const dateStr = $('.submitted').first().text().trim();
+  $('script, style, nav, footer, header').remove();
+
+  const paragraphs = [];
+  $('.content p, article p, .node-article p').each((_, p) => {
+    const txt = $(p).text().replace(/\s+/g, ' ').trim();
+    if (txt.length > 25 && !txt.includes('All rights reserved')) {
+      paragraphs.push(txt);
+    }
+  });
+
+  if (paragraphs.length === 0) return null;
+
+  return {
+    title,
+    url,
+    source: 'BullionVault',
+    category: 'Physical Gold / London Bullion',
+    published_at: dateStr || null,
+    content: paragraphs.join('\n\n'),
+    word_count: paragraphs.join(' ').split(/\s+/).length,
+    tags: ['Gold', 'BullionVault', 'LBMA', 'Bullion']
+  };
+}
+
+function parseEconomicTimes(html, url) {
+  const $ = cheerio.load(html);
+  const title = $('h1.artTitle, h1').first().text().trim();
+  if (!title) return null;
+
+  $('.artText').find('script, style, .promowidget, .embed_code, .stock_widget, table').remove();
+  const content = $('.artText').text().replace(/\s+/g, ' ').trim();
+  if (content.length < 50) return null;
+
+  const dateStr = $('.dt_block, .publish_date, time').first().text().trim();
+
+  return {
+    title,
+    url,
+    source: 'The Economic Times (Gold)',
+    category: 'Domestic & MCX Gold',
+    published_at: dateStr || null,
+    content,
+    word_count: content.split(/\s+/).length,
+    tags: ['Gold', 'Economic Times', 'MCX', 'India Gold Rates']
+  };
+}
+
+function parseBusinessStandard(html, url) {
+  const $ = cheerio.load(html);
+  const title = $('h1').first().text().trim();
+  if (!title) return null;
+
+  const dateStr = $('div[data-updatedtime]').attr('data-updatedtime') || $('.meta-info').first().text().trim();
+  $('script, style, nav, footer, header').remove();
+
+  const paragraphs = [];
+  $('.storydetail p, article p').each((_, p) => {
+    const txt = $(p).text().replace(/\s+/g, ' ').trim();
+    if (txt.length > 25 && !txt.includes('First Published:')) {
+      paragraphs.push(txt);
+    }
+  });
+
+  if (paragraphs.length === 0) return null;
+
+  return {
+    title,
+    url,
+    source: 'Business Standard (Gold)',
+    category: 'Commodities & Gold Markets',
+    published_at: dateStr || null,
+    content: paragraphs.join('\n\n'),
+    word_count: paragraphs.join(' ').split(/\s+/).length,
+    tags: ['Gold', 'Business Standard', 'Bullion', 'MCX']
+  };
+}
+
+function parseGoodReturns(html, url) {
+  const $ = cheerio.load(html);
+  const title = $('h1').first().text().trim() || 'Gold Rate Today in India';
+
+  const cityRates = [];
+  $('table tr').each((_, tr) => {
+    const tds = $(tr).find('td').map((_, el) => $(el).text().replace(/\s+/g, ' ').trim()).get();
+    if (tds.length >= 3 && tds[0] && (tds[1].includes('₹') || tds[1].replace(/[^0-9]/g, '').length >= 4)) {
+      cityRates.push({
+        city_or_unit: tds[0],
+        rate_22k: tds[1],
+        rate_24k: tds[2] || tds[1]
+      });
+    }
+  });
+
+  if (cityRates.length === 0) return null;
+
+  const todayStr = new Date().toISOString().split('T')[0];
+  const pageSlug = url.split('/').pop().replace('.html', '') || 'india';
+
+  return {
+    id: `goodreturns-gold-rate-${pageSlug}-${todayStr}`,
+    url: `${url}#${todayStr}`,
+    title: `${title} - ${pageSlug.toUpperCase()} (${todayStr})`,
+    source: 'GoodReturns (Gold Rates)',
+    category: 'India Spot 24K & 22K Rates',
+    published_at: todayStr,
+    rates_data: cityRates,
+    content: `Official domestic gold rates for ${pageSlug.toUpperCase()} on ${todayStr}. Rates: ${cityRates.map(r => `${r.city_or_unit}: 22K=${r.rate_22k}, 24K=${r.rate_24k}`).join('; ')}`,
+    tags: ['India Gold Rates', '24K Gold', '22K Gold', 'GoodReturns']
+  };
 }
 
 // -------------------------------------------------------------
-// Autonomous Continuous Relay & GitHub API Trigger
+// HIGH-SPEED CONCURRENT WORKER POOL
 // -------------------------------------------------------------
+
+async function processQueue(queue) {
+  const total = queue.length;
+  console.log(`🚀 Starting high-speed parallel extraction of ${total} URLs with ${CONCURRENCY} concurrent workers...`);
+
+  let processedCount = 0;
+  let successCount = 0;
+
+  async function worker(workerId) {
+    while (queue.length > 0 && !isShuttingDown) {
+      const item = queue.shift();
+      if (!item) break;
+
+      const hash = crypto.createHash('sha256').update(item.url).digest('hex');
+      if (registry[hash]) continue;
+
+      try {
+        const html = await fetchPage(item.url);
+        let article = null;
+
+        if (item.sourceSlug === 'Kitco_News') {
+          article = parseKitco(html, item.url);
+        } else if (item.sourceSlug === 'BullionVault') {
+          article = parseBullionVault(html, item.url);
+        } else if (item.sourceSlug === 'Economic_Times_Gold') {
+          article = parseEconomicTimes(html, item.url);
+        } else if (item.sourceSlug === 'Business_Standard_Gold') {
+          article = parseBusinessStandard(html, item.url);
+        } else if (item.sourceSlug === 'GoodReturns_Gold') {
+          article = parseGoodReturns(html, item.url);
+        }
+
+        if (article) {
+          if (storeArticle(item.sourceSlug, article)) {
+            successCount++;
+            if (successCount % 10 === 0) {
+              console.log(`  ⚡ [Worker ${workerId}] Ingested ${successCount} items (Latest: "${article.title.slice(0, 45)}...")`);
+            }
+          }
+        }
+      } catch (err) {
+        // Failed fetch or parse
+      }
+
+      processedCount++;
+      // Minimal polite delay (60ms) to maximize throughput without triggering rate limits
+      await sleep(60);
+    }
+  }
+
+  // Launch CONCURRENCY workers concurrently
+  const workers = Array.from({ length: CONCURRENCY }, (_, i) => worker(i + 1));
+  await Promise.all(workers);
+
+  console.log(`🏁 Spider extraction cycle complete: Processed ${processedCount} URLs | Ingested ${successCount} new items.`);
+}
+
+// -------------------------------------------------------------
+// RELAY DISPATCH & SHUTDOWN
+// -------------------------------------------------------------
+
 async function triggerNextRelay() {
   if (nextRelayTriggered) return;
   nextRelayTriggered = true;
@@ -595,7 +656,7 @@ async function triggerNextRelay() {
 async function handleShutdown(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;
-  console.log(`\n🛑 Received ${signal || 'shutdown signal'}. Commencing graceful sync & termination...`);
+  console.log(`\n🛑 Received ${signal || 'shutdown signal'}. Commencing final vault sync & termination...`);
   syncVault(true);
   console.log('🏁 Graceful shutdown complete. Process exiting.');
   process.exit(0);
@@ -605,17 +666,18 @@ process.on('SIGINT', () => handleShutdown('SIGINT'));
 process.on('SIGTERM', () => handleShutdown('SIGTERM'));
 
 // -------------------------------------------------------------
-// Main Autonomous Loop
+// MAIN AUTONOMOUS PIPELINE
 // -------------------------------------------------------------
+
 async function main() {
-  console.log('====================================================');
-  console.log('🏆 24x7 Gold & Bullion Scraping Pipeline Starting...');
+  console.log('================================================================');
+  console.log(`🏆 Blazing-Fast Gold Spider Scraper Pipeline Starting (${CONCURRENCY} Streams)...`);
   console.log(`🕒 Start Time: ${new Date().toISOString()}`);
-  console.log('====================================================');
+  console.log('================================================================');
 
   initVault();
 
-  // Periodic vault sync every 15 minutes
+  // Periodic vault sync every 10 minutes
   const syncTimer = setInterval(() => {
     syncVault(false);
   }, SYNC_INTERVAL_MS);
@@ -623,30 +685,50 @@ async function main() {
   while (!isShuttingDown) {
     const elapsed = Date.now() - START_TIME;
 
-    // Check if handover time reached (5h 20m)
     if (elapsed >= HANDOVER_TRIGGER_MS && !nextRelayTriggered) {
       await triggerNextRelay();
     }
 
-    // Check if full run duration reached (5.5 hours)
     if (elapsed >= RUN_DURATION_MS) {
       console.log('⏰ 5.5 Hours target duration reached. Handing over to next relay.');
       break;
     }
 
     try {
-      await scrapeKitco();
-      await scrapeBullionVault();
-      await scrapeEconomicTimes();
-      await scrapeBusinessStandard();
-      await scrapeGoodReturns();
-      syncVault(false);
+      console.log('\n🕷️ Commencing Deep Spider Discovery across all gold sources...');
+      const queue = [];
+
+      const [kitcoItems, bvItems, etItems, bsItems, grItems] = await Promise.all([
+        discoverKitco(),
+        discoverBullionVault(),
+        discoverEconomicTimes(),
+        discoverBusinessStandard(),
+        discoverGoodReturns()
+      ]);
+
+      const seen = new Set();
+      for (const item of [...kitcoItems, ...bvItems, ...etItems, ...bsItems, ...grItems]) {
+        if (!seen.has(item.url)) {
+          seen.add(item.url);
+          queue.push(item);
+        }
+      }
+
+      console.log(`🎯 Spider Discovery finished. Discovered ${queue.length} unvisited gold targets!`);
+
+      if (queue.length > 0) {
+        await processQueue(queue);
+        // Sync whatever remains
+        syncVault(false);
+      } else {
+        console.log('ℹ️ All sources are up-to-date. No new articles to process right now.');
+      }
     } catch (err) {
       console.error('❌ Cycle error:', err.message);
     }
 
-    console.log(`💤 Cycle completed. Sleeping 3 minutes before next discovery sweep... (Elapsed: ${Math.round(elapsed / 60000)}m / 330m)`);
-    await sleep(3 * 60 * 1000);
+    console.log(`💤 Sleeping 2 minutes before next spider sweep... (Elapsed: ${Math.round(elapsed / 60000)}m / 330m)`);
+    await sleep(2 * 60 * 1000);
   }
 
   clearInterval(syncTimer);
