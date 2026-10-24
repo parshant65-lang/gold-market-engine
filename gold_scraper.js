@@ -640,6 +640,7 @@ async function main() {
       await scrapeEconomicTimes();
       await scrapeBusinessStandard();
       await scrapeGoodReturns();
+      syncVault(false);
     } catch (err) {
       console.error('❌ Cycle error:', err.message);
     }
